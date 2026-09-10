@@ -49,10 +49,11 @@ enum BenchmarkWarmupMode: String, Codable, CaseIterable, Sendable {
 /// `batch_sizes` are server-validated against a known whitelist
 /// (1024…200000 / 2…8). `generation_length` is free-form int.
 ///
-/// The server always publishes results to the public omlx.ai
-/// leaderboard after the bench completes (matching the browser admin
-/// panel). Submission is anonymous — the payload carries an
-/// owner_hash derived from hardware fingerprint, not user identity.
+/// Publishing to the public omlx.ai leaderboard is opt-in via
+/// `uploadToLeaderboard` and off unless the user ticks it before the
+/// run. Submission is pseudonymous — the payload carries an owner_hash
+/// derived from the hardware UUID, not user identity, but that hash is
+/// stable across runs, which is why it takes an explicit yes.
 struct BenchStartRequest: Encodable, Sendable {
     let modelId: String
     let contextProfile: BenchmarkContextProfile
@@ -61,6 +62,8 @@ struct BenchStartRequest: Encodable, Sendable {
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
+    /// Defaulted so existing call sites stay local until they opt in.
+    var uploadToLeaderboard: Bool = false
 }
 
 struct BenchStartResponse: Codable, Sendable {
@@ -317,6 +320,10 @@ struct AccuracyQueueAddRequest: Encodable, Sendable {
     let benchmarks: [String: Int]
     let batchSize: Int
     let enableThinking: Bool
+    /// Opt-in publish to the public omlx.ai leaderboard. Defaults to
+    /// false at every call site — the server also defaults it off, so a
+    /// run only ever publishes when the user asked for it in this sheet.
+    var uploadToLeaderboard: Bool = false
 }
 
 struct AccuracyQueueItem: Codable, Equatable, Sendable {

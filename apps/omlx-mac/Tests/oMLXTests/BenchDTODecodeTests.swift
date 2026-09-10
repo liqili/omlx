@@ -54,6 +54,47 @@ final class BenchDTODecodeTests: XCTestCase {
         XCTAssertEqual(object["context_profile"] as? String, "novel_ko")
         XCTAssertEqual(object["warmup_mode"] as? String, "ane_2048")
         XCTAssertEqual(object["align_prompt_to_ane"] as? Bool, true)
+        // Leaderboard publishing is opt-in: a request built without asking
+        // for it must go out as false, under the exact key the server gates
+        // on. A typo here would silently publish nothing (or, if the
+        // default ever flipped, publish without consent).
+        XCTAssertEqual(object["upload_to_leaderboard"] as? Bool, false)
+    }
+
+    func testEncodeLeaderboardConsentWhenRequested() throws {
+        let request = BenchStartRequest(
+            modelId: "model",
+            contextProfile: .codePython,
+            warmupMode: .quick,
+            alignPromptToAne: false,
+            promptLengths: [1024],
+            generationLength: 128,
+            batchSizes: [2],
+            uploadToLeaderboard: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(request))
+                as? [String: Any]
+        )
+        XCTAssertEqual(object["upload_to_leaderboard"] as? Bool, true)
+    }
+
+    func testAccuracyQueueAddDefaultsToNoLeaderboardUpload() throws {
+        let request = AccuracyQueueAddRequest(
+            modelId: "model",
+            benchmarks: ["mmlu": 100],
+            batchSize: 4,
+            enableThinking: false
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(request))
+                as? [String: Any]
+        )
+        XCTAssertEqual(object["upload_to_leaderboard"] as? Bool, false)
     }
 
     @MainActor

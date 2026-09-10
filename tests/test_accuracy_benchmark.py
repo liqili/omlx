@@ -852,6 +852,7 @@ class TestCommunityUpload:
         req = AccuracyBenchmarkRequest(
             model_id="test-model",
             benchmarks={"mmlu": 4, "gsm8k": 4},
+            upload_to_leaderboard=True,
         )
         run = create_run(req)
 
@@ -902,12 +903,94 @@ class TestCommunityUpload:
             assert r["sampling_profile"] == "deterministic"
 
     @pytest.mark.asyncio
+    async def test_default_run_does_not_upload(self):
+        """No consent field means no publish — and no hardware UUID read.
+
+        build_upload_context is what derives owner_hash from the machine's
+        IOPlatformUUID, so an unconsented run must not even call it.
+        """
+        run = create_run(
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 4},
+            )
+        )
+        mock_build = MagicMock()
+        mock_upload = AsyncMock()
+
+        with (
+            patch.dict(
+                "omlx.eval.BENCHMARKS",
+                {"mmlu": self._mock_bench_cls("mmlu")},
+                clear=True,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.build_upload_context", mock_build
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.upload_intelligence_result",
+                mock_upload,
+            ),
+        ):
+            await run_accuracy_benchmark(run, self._mock_pool())
+
+        assert run.status == "completed"
+        mock_build.assert_not_called()
+        mock_upload.assert_not_awaited()
+        assert run.upload_ctx is None
+        assert run.upload_skipped_reason == "not_requested"
+        # The result still says why, so the UI can distinguish "you didn't
+        # ask to publish" from "the upload failed".
+        for r in get_accumulated_results():
+            assert r["upload"] == {"skipped": "not_requested"}
+
+    @pytest.mark.asyncio
+    async def test_operator_switch_overrides_consent(self, monkeypatch):
+        """OMLX_DISABLE_LEADERBOARD_UPLOAD wins over a per-run yes."""
+        monkeypatch.setenv("OMLX_DISABLE_LEADERBOARD_UPLOAD", "1")
+        run = create_run(
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 4},
+                upload_to_leaderboard=True,
+            )
+        )
+        mock_build = MagicMock()
+        mock_upload = AsyncMock()
+
+        with (
+            patch.dict(
+                "omlx.eval.BENCHMARKS",
+                {"mmlu": self._mock_bench_cls("mmlu")},
+                clear=True,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.build_upload_context", mock_build
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.upload_intelligence_result",
+                mock_upload,
+            ),
+        ):
+            await run_accuracy_benchmark(run, self._mock_pool())
+
+        assert run.status == "completed"
+        mock_build.assert_not_called()
+        mock_upload.assert_not_awaited()
+        assert run.upload_skipped_reason == "disabled_by_operator"
+
+    @pytest.mark.asyncio
     async def test_external_run_never_uploads(self):
+        # Consent given on purpose: external results measure someone
+        # else's hardware, so they must stay unpublished even when the
+        # user asked to publish. Without the flag this would pass on the
+        # no-consent path and never test external-ness at all.
         run = create_run(
             AccuracyBenchmarkRequest(
                 model_id="remote-model",
                 benchmarks={"mmlu": 100},
                 external=_external_dict(),
+                upload_to_leaderboard=True,
             )
         )
         mock_adapter = MagicMock()
@@ -949,8 +1032,14 @@ class TestCommunityUpload:
 
     @pytest.mark.asyncio
     async def test_upload_context_failure_only_disables_upload(self):
+        # Consent given, so the run reaches build_upload_context and this
+        # exercises the capture failure rather than the no-consent path.
         run = create_run(
-            AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 4},
+                upload_to_leaderboard=True,
+            )
         )
         mock_upload = AsyncMock()
 
@@ -978,7 +1067,11 @@ class TestCommunityUpload:
     @pytest.mark.asyncio
     async def test_upload_error_outcome_does_not_fail_bench(self):
         run = create_run(
-            AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 4},
+                upload_to_leaderboard=True,
+            )
         )
         error_outcome = {"error": "HTTP 500"}
 
