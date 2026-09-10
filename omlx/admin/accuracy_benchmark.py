@@ -19,6 +19,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, field_validator, model_validator
 
 from .accuracy_upload import build_upload_context, upload_intelligence_result
+from .benchmark import leaderboard_upload_allowed
 from .external_api import (
     ExternalAPIClient,
     ExternalChatAdapter,
@@ -70,6 +71,11 @@ class AccuracyBenchmarkRequest(BaseModel):
     batch_size: int = 1
     enable_thinking: bool = False
     sampling_profile: SamplingProfile = "deterministic"
+    # Opt-in publish to the public omlx.ai leaderboard, same contract as the
+    # throughput bench: default off, and a client that omits the field never
+    # uploads. Accuracy runs additionally ship the model's raw answers, so
+    # the consent matters more here than for throughput numbers alone.
+    upload_to_leaderboard: bool = False
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
     # model name (not validated against the local catalog).
@@ -134,9 +140,15 @@ class AccuracyBenchmarkRun:
     # (cancelled / error replace the terminal phase on those branches.)
     phase: str = "pending"
     # Snapshot for the omlx.ai upload, captured at run start (local runs
-    # only). None disables upload for the run — external endpoints, or a
-    # capture failure that must not fail the benchmark itself.
+    # only). None disables upload for the run — external endpoints, a run
+    # that did not opt in to publishing, or a capture failure that must not
+    # fail the benchmark itself.
     upload_ctx: Optional[dict] = None
+    # Why publishing was skipped, when it was: "not_requested" (no consent
+    # given for this run) or "disabled_by_operator". None means the run was
+    # eligible. Surfaced per suite so the UI can distinguish "you didn't ask
+    # to publish" from "the upload failed".
+    upload_skipped_reason: Optional[str] = None
 
 
 # Accuracy stream closes on `done` (run finished) or `error`. Unlike the
@@ -467,10 +479,19 @@ async def run_accuracy_benchmark(
             # Snapshot the upload context (hardware, quantization, feature
             # flags, submission group). A failure here only disables the
             # community upload, never the benchmark itself.
-            try:
-                run.upload_ctx = build_upload_context(request, engine_pool)
-            except Exception as e:
-                logger.warning(f"Accuracy upload context unavailable: {e}")
+            #
+            # Built only when the run opted in to publishing: the context is
+            # what reads the hardware UUID for owner_hash, so skipping it
+            # means an unconsented run never even derives the identifier.
+            upload_allowed, upload_skipped_reason = leaderboard_upload_allowed(
+                request.upload_to_leaderboard
+            )
+            run.upload_skipped_reason = upload_skipped_reason
+            if upload_allowed:
+                try:
+                    run.upload_ctx = build_upload_context(request, engine_pool)
+                except Exception as e:
+                    logger.warning(f"Accuracy upload context unavailable: {e}")
 
         # Phase 3: Run each benchmark
         run.phase = "evaluating"
@@ -664,6 +685,19 @@ async def run_accuracy_benchmark(
                 outcome = await upload_intelligence_result(
                     run, run.upload_ctx, result_data
                 )
+                result_data["upload"] = outcome
+                await _send_event(run, {
+                    "type": "upload",
+                    "data": {
+                        "model_id": request.model_id,
+                        "benchmark": result_data["benchmark"],
+                        **outcome,
+                    },
+                })
+            elif run.upload_skipped_reason is not None:
+                # Say so explicitly rather than leaving the result card with
+                # no upload field, which reads as "the upload failed".
+                outcome = {"skipped": run.upload_skipped_reason}
                 result_data["upload"] = outcome
                 await _send_event(run, {
                     "type": "upload",

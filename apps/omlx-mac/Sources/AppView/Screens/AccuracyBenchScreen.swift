@@ -60,6 +60,7 @@ struct AccuracyBenchScreen: View {
                 selectedModelId: $vm.selectedModelId,
                 batchSize: $vm.batchSize,
                 enableThinking: $vm.enableThinking,
+                uploadToLeaderboard: $vm.uploadToLeaderboard,
                 selectedBenchmarks: $vm.selectedBenchmarks,
                 sampleSizes: $vm.sampleSizes,
                 isAdding: vm.isAdding,
@@ -173,6 +174,7 @@ private struct ConfigurationSection: View {
     @Binding var selectedModelId: String
     @Binding var batchSize: Int
     @Binding var enableThinking: Bool
+    @Binding var uploadToLeaderboard: Bool
     @Binding var selectedBenchmarks: Set<String>
     @Binding var sampleSizes: [String: Int]
     let isAdding: Bool
@@ -223,6 +225,17 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Accuracy Bench extended-thinking toggle")
             ) {
                 RowSwitch(isOn: $enableThinking)
+            }
+
+            Row(
+                label: String(localized: "bench.accuracy.row.upload_leaderboard.label",
+                              defaultValue: "Publish to the omlx.ai leaderboard",
+                              comment: "Row label for the opt-in community leaderboard upload"),
+                sublabel: String(localized: "bench.accuracy.row.upload_leaderboard.sub",
+                                 defaultValue: "Off by default. Sends your hardware specs, macOS and oMLX versions, model name, settings and scores, plus the model's own answers to each question and an anonymous ID derived from this Mac's hardware UUID. Question text, prompts, chat messages and API keys are not sent.",
+                                 comment: "Explains exactly what the accuracy leaderboard upload transmits")
+            ) {
+                RowSwitch(isOn: $uploadToLeaderboard)
             }
 
             FreeRow {

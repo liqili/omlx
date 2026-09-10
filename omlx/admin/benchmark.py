@@ -113,6 +113,13 @@ class BenchmarkRequest(BaseModel):
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
     align_prompt_to_ane: bool = False
     force_lm_engine: bool = False
+    # Publishing to the public omlx.ai leaderboard is opt-in and defaults
+    # off. The submission is pseudonymous rather than anonymous — it
+    # carries an owner_hash derived from the machine's hardware UUID, which
+    # is stable across runs — so it needs a deliberate yes rather than a
+    # silent publish. A client that does not send the field never uploads,
+    # which keeps older clients and direct API callers local by default.
+    upload_to_leaderboard: bool = False
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
     # model name (not validated against the local catalog).
@@ -1264,6 +1271,32 @@ async def _run_external_batch_test(
 
 OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
 
+# Operator-level hard opt-out. Per-run consent already defaults to off, but
+# an admin running a shared server needs a way to guarantee no run can
+# publish, whatever a client asks for. Set to 1/true/yes/on to enforce.
+LEADERBOARD_UPLOAD_DISABLED_ENV = "OMLX_DISABLE_LEADERBOARD_UPLOAD"
+
+
+def leaderboard_upload_disabled() -> bool:
+    """True when the operator has hard-disabled leaderboard publishing."""
+    value = os.getenv(LEADERBOARD_UPLOAD_DISABLED_ENV, "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def leaderboard_upload_allowed(requested: bool) -> tuple[bool, str | None]:
+    """Resolve per-run consent against the operator switch.
+
+    Returns (allowed, skipped_reason). The reason is surfaced to clients so
+    the UI can say why nothing was published instead of leaving the user to
+    guess whether the upload silently failed.
+    """
+    if leaderboard_upload_disabled():
+        return False, "disabled_by_operator"
+    if not requested:
+        return False, "not_requested"
+    return True, None
+
+
 # The leaderboard accepts model_name up to 150 characters.
 _MAX_MODEL_NAME_LEN = 150
 
@@ -2070,6 +2103,25 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 {
                     "type": "upload_skipped",
                     "reason": "ane_aligned_prompt",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
+        # Publishing to the public leaderboard is opt-in. Without an
+        # explicit yes the run stays entirely local — nothing leaves the
+        # machine, not even the pseudonymous owner_hash.
+        allowed, skipped_reason = leaderboard_upload_allowed(
+            request.upload_to_leaderboard
+        )
+        if not allowed:
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = skipped_reason
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": skipped_reason,
                     "features": run.feature_flags,
                 },
             )

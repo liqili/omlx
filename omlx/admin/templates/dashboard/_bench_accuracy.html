@@ -68,6 +68,19 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
                             </div>
 
+                            <!-- Publish to the public leaderboard (opt-in) -->
+                            <div class="pt-2 border-t border-neutral-100">
+                                <label class="inline-flex items-start gap-2 cursor-pointer">
+                                    <input type="checkbox"
+                                           x-model="accUploadConsent"
+                                           class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                    <span>
+                                        <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.upload_leaderboard') }}</span>
+                                        <span class="block text-xs text-neutral-400 mt-1">{{ t('acc_bench.config.upload_leaderboard_hint') }}</span>
+                                    </span>
+                                </label>
+                            </div>
+
                             <!-- Advanced Options -->
                             <div class="pt-2 border-t border-neutral-100">
                                 <button type="button"
