@@ -1,0 +1,546 @@
+name: Release macOS app
+
+# Builds, signs, notarizes and publishes the oMLX.app DMGs.
+#
+# This is the pipeline that packaging/README.md describes as the
+# "off-tree maintainer pipeline" — it now lives in-tree.
+#
+# Two DMGs are produced per release, because the bundled mlx/mlx-metal
+# wheels are platform-specific: the macOS 26 wheels carry the M5 Neural
+# Accelerator matmul kernels, the macOS 15 wheels do not. The asset
+# names embed the macOS major they target, which is exactly what the
+# in-app updater matches on — see ReleasesChecker.findMatchingDMG, whose
+# regex is `(?:^|[-_])macos(\d+)(?:-(\d+))?(?=$|[-_.])`:
+#
+#   oMLX-<version>-macos15-sequoia.dmg   -> exact match on macOS 15
+#   oMLX-<version>-macos26-27.dmg        -> range match on macOS 26 / 27
+#
+# Renaming these breaks in-app updates silently (the updater falls back
+# to "No matching DMG asset for this macOS version"), so keep the
+# `macos<major>` token intact if you change them.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag to attach the DMGs to (e.g. v0.6.4).
+          Leave empty to build artifacts only, without publishing.
+        required: false
+        default: ""
+      allow_unsigned:
+        description: >-
+          Build without Developer ID signing / notarization. Artifacts
+          only — never publishable. For pipeline debugging.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a release build midway: a half-uploaded set of assets
+  # is worse than a duplicate run.
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned for reproducibility. The build needs Xcode 26.2+: Swift 6
+  # language mode (SWIFT_VERSION = 6.0), the macOS 26 SDK for the
+  # Icon Composer AppIcon.icon compile, and SDK >= 26.2 for the Qwen3.5
+  # NAX metallib. If the runner image drops this version the "Select
+  # Xcode" step falls back to the newest Xcode 26.x present.
+  XCODE_VERSION: "26.2"
+  # build.sh defaults to this; set explicitly so the deployment-target
+  # assertion on the custom kernels is pinned by the workflow too.
+  OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET: "15.0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_suffix }}
+    # macos-26 is Apple Silicon and ships the Xcode 26.x toolchains.
+    # MLX is arm64-only, so an Intel runner cannot build this at all.
+    runs-on: macos-26
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - macos_target: "15.0"
+            asset_suffix: macos15-sequoia
+          - macos_target: "26.0"
+            asset_suffix: macos26-27
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          xcode="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$xcode" ]; then
+            echo "::warning::Xcode ${XCODE_VERSION} not on this image; falling back to newest Xcode 26.x"
+            xcode="$(/bin/ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          fi
+          [ -n "$xcode" ] && [ -d "$xcode" ] || { echo "no Xcode 26.x found on the runner"; exit 1; }
+
+          sudo xcode-select -s "$xcode/Contents/Developer"
+
+          # build.sh invokes actool by its absolute path under
+          # /Applications/Xcode.app, ignoring DEVELOPER_DIR. Point the
+          # symlink at the same Xcode so the AppIcon.icon compile does
+          # not silently fall back to a different toolchain.
+          if [ "$xcode" != "/Applications/Xcode.app" ]; then
+            sudo ln -sfn "$xcode" /Applications/Xcode.app
+          fi
+
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+          swift --version
+
+      - name: Assert the SDK can build the NAX metallib
+        # build.sh only *warns* when the SDK predates 26.2 and then ships
+        # a bundle whose M5 qmm quietly falls back to the classic kernels
+        # (the failure shape of issue #2137). A release must never go out
+        # that way, so make it fatal here.
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun -sdk macosx --show-sdk-version)"
+          echo "macOS SDK: $sdk"
+          if [ "$(printf '%s\n26.2\n' "$sdk" | sort -V | head -1)" != "26.2" ]; then
+            echo "::error::macOS SDK $sdk < 26.2 — the Qwen3.5 NAX metallib would be omitted."
+            exit 1
+          fi
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build tooling
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # venvstacks >= 0.7.0 comes from the [dev] extra.
+          python -m pip install -e ".[dev]"
+          # The custom kernels are built by setup.py build_ext *without*
+          # pip build isolation, so the [build-system] nanobind pin is not
+          # enforced for them. build.sh hard-fails on a mismatch (issue
+          # #2139); read the pin from pyproject rather than duplicating it.
+          nanobind_pin="$(sed -n 's/^[[:space:]]*"nanobind==\([0-9][0-9.]*\)".*/\1/p' pyproject.toml | head -1)"
+          [ -n "$nanobind_pin" ] || { echo "could not read the nanobind pin from pyproject.toml"; exit 1; }
+          echo "Pinning nanobind==$nanobind_pin"
+          python -m pip install "nanobind==$nanobind_pin" "cmake>=3.27" setuptools wheel
+
+      - name: Resolve version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          # omlx/_version.py is canonical — pyproject reads it dynamically
+          # and build.sh mirrors it into CFBundleShortVersionString.
+          version="$(sed -nE 's/^__version__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' omlx/_version.py)"
+          [ -n "$version" ] || { echo "could not parse __version__ from omlx/_version.py"; exit 1; }
+
+          # A tag that disagrees with _version.py would ship a bundle whose
+          # CFBundleShortVersionString does not match the release the
+          # updater compares against. Fail loudly instead.
+          if [ -n "${RELEASE_TAG}" ] && [ "${RELEASE_TAG#v}" != "$version" ]; then
+            echo "::error::tag ${RELEASE_TAG} does not match omlx/_version.py ($version)"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=oMLX-$version-${{ matrix.asset_suffix }}.dmg" >> "$GITHUB_OUTPUT"
+          echo "Building oMLX $version for ${{ matrix.asset_suffix }}"
+
+      - name: Check signing configuration
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CERT_P12" ] && [ -n "$SIGNING_IDENTITY" ] && [ -n "$NOTARY_APPLE_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          # Notarization stapled to each DMG is the updater's only trust
+          # boundary (see UpdateController.swift), so an unsigned DMG must
+          # never reach a published release. allow_unsigned is therefore
+          # only honoured for a dispatch that publishes nothing — i.e. one
+          # with no tag to attach to.
+          if [ "$ALLOW_UNSIGNED" = "true" ] \
+             && [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ -z "$RELEASE_TAG" ]; then
+            echo "::warning::Building UNSIGNED (allow_unsigned). Artifacts only — nothing is published."
+          else
+            echo "::error::Signing secrets missing. Configure MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD, MACOS_SIGNING_IDENTITY, APPLE_ID, APPLE_APP_PASSWORD, APPLE_TEAM_ID — or re-run via workflow_dispatch with allow_unsigned and no tag."
+            exit 1
+          fi
+
+      - name: Free disk space
+        # The staged .app is several GB (framework-mlx-base alone is ~1 GB)
+        # and the DMG is built alongside it. Runner-local paths only.
+        run: |
+          set -euo pipefail
+          df -h /
+          keep="$(basename "$(dirname "$(dirname "$DEVELOPER_DIR")")")"
+          for app in /Applications/Xcode_*.app; do
+            [ "$(basename "$app")" = "$keep" ] && continue
+            sudo rm -rf "$app"
+          done
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches
+          df -h /
+
+      - name: Build venvstacks Python layers (target macOS ${{ matrix.macos_target }})
+        # --macos-target swaps mlx/mlx-metal for the target platform's
+        # wheels after the export, then rewrites .fingerprint so the
+        # build.sh freshness check below sees a matching export.
+        run: |
+          set -euo pipefail
+          python packaging/build.py --venvstacks-only --macos-target "${{ matrix.macos_target }}"
+          ls -la packaging/_export
+
+      - name: Build oMLX.app
+        env:
+          OMLX_EXPORT_DIR: ${{ github.workspace }}/packaging/_export
+        run: |
+          set -euo pipefail
+          apps/omlx-mac/Scripts/build.sh release \
+            --no-rebuild-donor \
+            --with-custom-kernel
+
+      - name: Verify bundle contents
+        run: |
+          set -euo pipefail
+          app="apps/omlx-mac/build/Stage/oMLX.app"
+          [ -d "$app" ] || { echo "::error::$app was not produced"; exit 1; }
+
+          fail=0
+          for required in \
+            "Contents/Resources/Python/cpython-3.11" \
+            "Contents/Resources/Python/framework-mlx-base" \
+            "Contents/Resources/omlx/_engine_commits.json" \
+            "Contents/MacOS/omlx-cli" \
+            "Contents/MacOS/omlx-cluster-python" \
+            "Contents/Resources/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels_nax.metallib"
+          do
+            if [ ! -e "$app/$required" ]; then
+              echo "::error::missing from the bundle: $required"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          short="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+          if [ "$short" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::CFBundleShortVersionString $short != ${{ steps.version.outputs.version }}"
+            exit 1
+          fi
+          echo "Bundle OK — version $short, $(du -sh "$app" | cut -f1)"
+
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/omlx-signing.keychain-db"
+          # Ephemeral keychain password: the keychain dies with the runner.
+          keychain_password="$(uuidgen)"
+          echo "::add-mask::$keychain_password"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          cert="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$CERT_P12" | base64 --decode > "$cert"
+          security import "$cert" \
+            -k "$keychain" \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          rm -f "$cert"
+
+          # Without this codesign blocks on a UI prompt for key access.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+
+          # Keep the login keychain in the search list so the Apple
+          # intermediate certs still resolve.
+          security list-keychains -d user -s "$keychain" login.keychain-db
+
+          echo "Signing identities:"
+          security find-identity -v -p codesigning "$keychain"
+
+      - name: Sign with Developer ID and hardened runtime
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          app="apps/omlx-mac/build/Stage/oMLX.app"
+          keychain="$RUNNER_TEMP/omlx-signing.keychain-db"
+
+          # The bundle loads hundreds of Python extension modules and MLX
+          # dylibs that are not signed by our team, so the main executable
+          # needs library validation disabled. Keep this scoped to the
+          # release signature rather than editing Resources/oMLX.entitlements,
+          # which governs the local ad-hoc builds.
+          entitlements="$RUNNER_TEMP/release.entitlements"
+          cat > "$entitlements" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.app-sandbox</key>
+            <false/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+            <true/>
+            <key>com.apple.security.device.audio-input</key>
+            <true/>
+            <key>com.apple.security.network.client</key>
+            <true/>
+            <key>com.apple.security.network.server</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$entitlements"
+
+          echo "Signing embedded Mach-O code (inside-out)…"
+          # Same traversal as build.sh's _sign_embedded_mach_o_files, with
+          # the real identity plus a secure timestamp (notarization
+          # rejects any signature without one). Batched through xargs
+          # because each signature costs a timestamp round-trip.
+          #
+          # Rooted at the whole bundle, not just Resources/Python the way
+          # build.sh does: --with-custom-kernel also drops native _ext*.so
+          # and lib*.dylib under Resources/omlx/custom_kernels/, and
+          # notarization rejects the DMG if even one of those is left with
+          # an ad-hoc signature.
+          find "$app" \
+              \( -path "*/.dSYM/*" -o -path "*/__pycache__/*" \) -prune -o \
+              -type f \( \
+                  -name "*.so" -o \
+                  -name "*.dylib" -o \
+                  -name "*.bundle" -o \
+                  -perm -100 -o \
+                  -perm -010 -o \
+                  -perm -001 \
+              \) -print0 \
+            | while IFS= read -r -d '' path; do
+                case "$(file -b "$path" 2>/dev/null || true)" in
+                  *Mach-O*) printf '%s\0' "$path" ;;
+                esac
+              done \
+            | xargs -0 -n 20 -P 4 codesign \
+                --force \
+                --timestamp \
+                --options runtime \
+                --keychain "$keychain" \
+                --sign "$SIGNING_IDENTITY"
+
+          # Nested *bundles* must be signed as bundles, not just as the
+          # Mach-O binary inside them, or the outer seal will not validate.
+          # SPM products (swift-markdown-ui / NetworkImage) land here when
+          # Xcode embeds them dynamically.
+          for nested in \
+            "$app/Contents/Frameworks"/*.framework \
+            "$app/Contents/Frameworks"/*.bundle \
+            "$app/Contents/PlugIns"/*
+          do
+            [ -e "$nested" ] || continue
+            echo "  signing nested bundle $(basename "$nested")"
+            codesign --force --timestamp --options runtime \
+              --keychain "$keychain" --sign "$SIGNING_IDENTITY" \
+              "$nested"
+          done
+
+          echo "Signing CLI wrappers…"
+          for wrapper in omlx-cli omlx-cluster-python; do
+            codesign --force --timestamp --options runtime \
+              --keychain "$keychain" --sign "$SIGNING_IDENTITY" \
+              "$app/Contents/MacOS/$wrapper"
+          done
+
+          echo "Sealing the app bundle…"
+          codesign --force --timestamp --options runtime \
+            --entitlements "$entitlements" \
+            --keychain "$keychain" \
+            --sign "$SIGNING_IDENTITY" \
+            "$app"
+
+          echo "Verifying…"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --entitlements - "$app"
+
+      - name: Build DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          app="apps/omlx-mac/build/Stage/oMLX.app"
+          dmg_name="${{ steps.version.outputs.dmg_name }}"
+          out="$RUNNER_TEMP/dist"
+          root="$RUNNER_TEMP/dmg-root"
+          mkdir -p "$out" "$root"
+
+          ditto "$app" "$root/oMLX.app"
+          ln -s /Applications "$root/Applications"
+
+          # hdiutil intermittently reports "Resource busy" on hosted
+          # runners while Spotlight/fsevents still hold the source tree.
+          for attempt in 1 2 3; do
+            if hdiutil create \
+                -volname "oMLX ${{ steps.version.outputs.version }}" \
+                -srcfolder "$root" \
+                -fs HFS+ \
+                -format UDZO \
+                -ov \
+                "$out/$dmg_name"; then
+              break
+            fi
+            [ "$attempt" -lt 3 ] || { echo "::error::hdiutil failed after 3 attempts"; exit 1; }
+            echo "hdiutil attempt $attempt failed; retrying in 30s"
+            sleep 30
+          done
+
+          echo "dist=$out" >> "$GITHUB_OUTPUT"
+          ls -lh "$out/$dmg_name"
+
+      - name: Sign DMG
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp \
+            --keychain "$RUNNER_TEMP/omlx-signing.keychain-db" \
+            --sign "$SIGNING_IDENTITY" \
+            "${{ steps.dmg.outputs.dist }}/${{ steps.version.outputs.dmg_name }}"
+
+      - name: Notarize and staple
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          dmg="${{ steps.dmg.outputs.dist }}/${{ steps.version.outputs.dmg_name }}"
+
+          if ! xcrun notarytool submit "$dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait \
+              --timeout 2h \
+              --output-format json > "$RUNNER_TEMP/notary.json"; then
+            echo "::error::notarytool submit failed"
+            submission="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$RUNNER_TEMP/notary.json" 2>/dev/null || true)"
+            if [ -n "$submission" ]; then
+              xcrun notarytool log "$submission" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+            fi
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/notary.json"
+
+          # Staple, so the DMG validates offline. This is what the in-app
+          # updater relies on as its trust boundary.
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature -vv "$dmg"
+
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          cd "${{ steps.dmg.outputs.dist }}"
+          shasum -a 256 "${{ steps.version.outputs.dmg_name }}" \
+            > "${{ steps.version.outputs.dmg_name }}.sha256"
+          cat "${{ steps.version.outputs.dmg_name }}.sha256"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dmg-${{ matrix.asset_suffix }}
+          path: |
+            ${{ steps.dmg.outputs.dist }}/*.dmg
+            ${{ steps.dmg.outputs.dist }}/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Clean up keychain
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: |
+          security list-keychains -d user -s login.keychain-db || true
+          security delete-keychain "$RUNNER_TEMP/omlx-signing.keychain-db" || true
+
+  publish:
+    name: Attach DMGs to release
+    needs: build
+    # Only publishes for a real release, or a dispatch that named a tag.
+    # Both of those paths require signing secrets — the build job's
+    # "Check signing configuration" step fails the run otherwise — so
+    # nothing unsigned can reach this job.
+    if: github.event_name == 'release' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: dmg-*
+          merge-multiple: true
+
+      - name: Verify both DMGs are present
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          count="$(find dist -name '*.dmg' | wc -l | tr -d ' ')"
+          if [ "$count" -ne 2 ]; then
+            echo "::error::expected 2 DMGs (macos15 + macos26), found $count"
+            exit 1
+          fi
+          # The updater matches on this token; a rename silently disables
+          # in-app updates for that macOS major.
+          for dmg in dist/*.dmg; do
+            case "$(basename "$dmg")" in
+              *macos15*|*macos26*) ;;
+              *) echo "::error::$dmg has no macos<major> token the updater can match"; exit 1 ;;
+            esac
+          done
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          cat dist/*.sha256 > dist/SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" \
+            dist/*.dmg dist/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" --clobber
