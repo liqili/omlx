@@ -27,16 +27,10 @@ on:
       tag:
         description: >-
           Existing release tag to attach the DMGs to (e.g. v0.6.4).
-          Leave empty to build artifacts only, without publishing.
+          Leave empty to build artifacts only, without publishing —
+          that path does not require the Apple signing secrets.
         required: false
         default: ""
-      allow_unsigned:
-        description: >-
-          Build without Developer ID signing / notarization. Artifacts
-          only — never publishable. For pipeline debugging.
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
@@ -165,28 +159,28 @@ jobs:
           CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
-          ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           if [ -n "$CERT_P12" ] && [ -n "$SIGNING_IDENTITY" ] && [ -n "$NOTARY_APPLE_ID" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets present — the DMGs will be signed and notarized."
             exit 0
           fi
           echo "enabled=false" >> "$GITHUB_OUTPUT"
+
           # Notarization stapled to each DMG is the updater's only trust
           # boundary (see UpdateController.swift), so an unsigned DMG must
-          # never reach a published release. allow_unsigned is therefore
-          # only honoured for a dispatch that publishes nothing — i.e. one
-          # with no tag to attach to.
-          if [ "$ALLOW_UNSIGNED" = "true" ] \
-             && [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-             && [ -z "$RELEASE_TAG" ]; then
-            echo "::warning::Building UNSIGNED (allow_unsigned). Artifacts only — nothing is published."
-          else
-            echo "::error::Signing secrets missing. Configure MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD, MACOS_SIGNING_IDENTITY, APPLE_ID, APPLE_APP_PASSWORD, APPLE_TEAM_ID — or re-run via workflow_dispatch with allow_unsigned and no tag."
+          # never reach a published release. A run that publishes nothing
+          # is a different matter: building unsigned artifacts is the
+          # normal way to exercise this pipeline on a fork with no Apple
+          # Developer account, so it warns instead of failing.
+          if [ -n "$RELEASE_TAG" ]; then
+            echo "::error::Cannot publish to $RELEASE_TAG without signing secrets. Configure MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD, MACOS_SIGNING_IDENTITY, APPLE_ID, APPLE_APP_PASSWORD and APPLE_TEAM_ID, or re-run this workflow with an empty tag to build unsigned artifacts."
             exit 1
           fi
+
+          echo "::warning::No signing secrets configured — building UNSIGNED artifacts. They are downloadable from this run but are not published, and macOS Gatekeeper will refuse to open them without a right-click → Open. Configure the Apple secrets to produce releasable DMGs."
 
       - name: Free disk space
         # The staged .app is several GB (framework-mlx-base alone is ~1 GB)
@@ -504,7 +498,8 @@ jobs:
     # Only publishes for a real release, or a dispatch that named a tag.
     # Both of those paths require signing secrets — the build job's
     # "Check signing configuration" step fails the run otherwise — so
-    # nothing unsigned can reach this job.
+    # nothing unsigned can reach this job. A dispatch with no tag builds
+    # unsigned artifacts and stops before here.
     if: github.event_name == 'release' || inputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
