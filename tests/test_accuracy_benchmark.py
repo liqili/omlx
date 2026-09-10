@@ -981,11 +981,16 @@ class TestCommunityUpload:
 
     @pytest.mark.asyncio
     async def test_external_run_never_uploads(self):
+        # Consent given on purpose: external results measure someone
+        # else's hardware, so they must stay unpublished even when the
+        # user asked to publish. Without the flag this would pass on the
+        # no-consent path and never test external-ness at all.
         run = create_run(
             AccuracyBenchmarkRequest(
                 model_id="remote-model",
                 benchmarks={"mmlu": 100},
                 external=_external_dict(),
+                upload_to_leaderboard=True,
             )
         )
         mock_adapter = MagicMock()
@@ -1027,8 +1032,14 @@ class TestCommunityUpload:
 
     @pytest.mark.asyncio
     async def test_upload_context_failure_only_disables_upload(self):
+        # Consent given, so the run reaches build_upload_context and this
+        # exercises the capture failure rather than the no-consent path.
         run = create_run(
-            AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 4},
+                upload_to_leaderboard=True,
+            )
         )
         mock_upload = AsyncMock()
 
@@ -1056,7 +1067,11 @@ class TestCommunityUpload:
     @pytest.mark.asyncio
     async def test_upload_error_outcome_does_not_fail_bench(self):
         run = create_run(
-            AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 4},
+                upload_to_leaderboard=True,
+            )
         )
         error_outcome = {"error": "HTTP 500"}
 
