@@ -9,6 +9,9 @@ final class AccuracyBenchScreenVM {
     var sampleSizes: [String: Int] = [:]
     var batchSize: Int = 4
     var enableThinking: Bool = false
+    /// Opt-in publish to the public omlx.ai leaderboard. Not persisted —
+    /// asked per queued run, same contract as the throughput bench.
+    var uploadToLeaderboard: Bool = false
 
     // Server state
     private(set) var models: [ModelDTO] = []
@@ -113,7 +116,8 @@ final class AccuracyBenchScreenVM {
             modelId: modelId,
             benchmarks: benchmarks,
             batchSize: batchSize,
-            enableThinking: enableThinking
+            enableThinking: enableThinking,
+            uploadToLeaderboard: uploadToLeaderboard
         )
         isAdding = true
         lastError = nil

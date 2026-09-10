@@ -169,6 +169,20 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.batch_hint') }}</p>
                             </div>
 
+                            <!-- Publish to the public leaderboard (opt-in) -->
+                            <div class="pt-2 border-t border-neutral-100">
+                                <label class="inline-flex items-start gap-2 cursor-pointer">
+                                    <input type="checkbox"
+                                           x-model="benchUploadConsent"
+                                           :disabled="benchRunning"
+                                           class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                    <span>
+                                        <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.upload_leaderboard') }}</span>
+                                        <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.upload_leaderboard_hint') }}</span>
+                                    </span>
+                                </label>
+                            </div>
+
                             <!-- Advanced Options -->
                             <div class="pt-2 border-t border-neutral-100">
                                 <button type="button"
@@ -486,7 +500,11 @@
                         </div>
                         <div class="px-6 py-4 space-y-2">
                             <p class="text-sm text-amber-600"
-                               x-text="t('bench.upload_skipped.reason_external')"></p>
+                               x-text="benchUploadSkipped && benchUploadSkipped.reason === 'not_requested'
+                                       ? t('bench.upload.skipped.not_requested')
+                                       : (benchUploadSkipped && benchUploadSkipped.reason === 'disabled_by_operator'
+                                          ? t('bench.upload.skipped.disabled_by_operator')
+                                          : t('bench.upload_skipped.reason_external'))"></p>
                         </div>
                     </div>
 

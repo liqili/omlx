@@ -65,6 +65,7 @@ struct ThroughputBenchScreen: View {
                 contextProfile: $vm.contextProfile,
                 warmupMode: $vm.warmupMode,
                 alignPromptToAne: $vm.alignPromptToAne,
+                uploadToLeaderboard: $vm.uploadToLeaderboard,
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
@@ -163,6 +164,7 @@ private struct ConfigurationSection: View {
     @Binding var contextProfile: BenchmarkContextProfile
     @Binding var warmupMode: BenchmarkWarmupMode
     @Binding var alignPromptToAne: Bool
+    @Binding var uploadToLeaderboard: Bool
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
@@ -242,6 +244,16 @@ private struct ConfigurationSection: View {
                                  defaultValue: "Add one prompt token so PP4097 produces exactly 4,096 prefill rows. Aligned results remain local.",
                                  comment: "Explanation of the ANE-aligned throughput benchmark option")) {
                 RowSwitch(isOn: $alignPromptToAne)
+                    .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.upload_leaderboard.label",
+                              defaultValue: "Publish to the omlx.ai leaderboard",
+                              comment: "Row label for the opt-in community leaderboard upload"),
+                sublabel: String(localized: "bench.throughput.row.upload_leaderboard.sub",
+                                 defaultValue: "Off by default. Sends your hardware specs, macOS and oMLX versions, model name, settings and scores, plus an anonymous ID derived from this Mac's hardware UUID. No prompts, chat messages or API keys are sent.",
+                                 comment: "Explains exactly what the leaderboard upload transmits")) {
+                RowSwitch(isOn: $uploadToLeaderboard)
                     .disabled(running)
             }
 
@@ -707,12 +719,14 @@ private struct TextExportSection: View {
 // MARK: - Community leaderboard upload
 
 /// Renders the result of the post-bench upload to the public omlx.ai
-/// leaderboard. The upload happens server-side automatically after every
-/// run (omlx/admin/benchmark.py:_upload_to_omlx_ai); we just surface the
-/// state. Three modes:
+/// leaderboard. The upload runs server-side only when the run opted in
+/// (omlx/admin/benchmark.py:_upload_to_omlx_ai, gated on
+/// `upload_to_leaderboard`); we just surface the state. Three modes:
 ///   • uploading: progress row + spinner
-///   • skipped:   amber banner (external-endpoint runs only — accelerated
-///                runs upload and are tagged instead)
+///   • skipped:   amber banner — an external-endpoint run, a run that did
+///                not opt in ("not_requested"), or a server with
+///                publishing disabled ("disabled_by_operator").
+///                Accelerated runs upload and are tagged instead.
 ///   • done:      per-context-length rows with link or error, plus a
 ///                summary footer showing the owner hash
 /// Acceleration flags active during the run are shown as chips above the
@@ -945,6 +959,14 @@ private struct SkippedBanner: View {
             return String(localized: "bench.throughput.upload.skipped.external",
                           defaultValue: "External endpoint results are not submitted because they measure remote hardware.",
                           comment: "Skipped-upload reason when the benchmark ran against an external endpoint")
+        case "not_requested":
+            return String(localized: "bench.throughput.upload.skipped.not_requested",
+                          defaultValue: "Not published. Turn on “Publish to the omlx.ai leaderboard” before starting a run to submit it.",
+                          comment: "Skipped-upload reason when the run did not opt in to publishing")
+        case "disabled_by_operator":
+            return String(localized: "bench.throughput.upload.skipped.disabled",
+                          defaultValue: "Leaderboard publishing is disabled on this server.",
+                          comment: "Skipped-upload reason when the operator disabled leaderboard publishing")
         default:
             return String(localized: "bench.throughput.upload.skipped.default",
                           defaultValue: "The server skipped uploading these results.",

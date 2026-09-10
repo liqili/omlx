@@ -32,6 +32,8 @@ from omlx.admin.benchmark import (
     cleanup_old_runs,
     create_run,
     get_run,
+    leaderboard_upload_allowed,
+    leaderboard_upload_disabled,
     run_benchmark,
 )
 
@@ -2228,3 +2230,81 @@ class TestAneBenchmarkTrace:
         assert "configured_layers=64" in mlp_line
         assert "compiled_layers=unknown" in mlp_line
         assert "expected_operations=64" in mlp_line
+
+
+# =============================================================================
+# Leaderboard upload consent
+# =============================================================================
+
+
+class TestLeaderboardConsent:
+    """Publishing to omlx.ai is opt-in.
+
+    The submission carries an owner_hash derived from the machine's
+    hardware UUID and is stable across runs, so it takes an explicit yes.
+    A client that omits the field never publishes, which keeps older
+    clients and direct API callers local by default.
+    """
+
+    def test_request_defaults_to_no_upload(self):
+        req = BenchmarkRequest(model_id="m", prompt_lengths=[1024])
+        assert req.upload_to_leaderboard is False
+
+    def test_consent_required(self):
+        assert leaderboard_upload_allowed(False) == (False, "not_requested")
+        assert leaderboard_upload_allowed(True) == (True, None)
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_operator_switch_blocks_even_with_consent(self, monkeypatch, value):
+        monkeypatch.setenv("OMLX_DISABLE_LEADERBOARD_UPLOAD", value)
+        assert leaderboard_upload_disabled() is True
+        assert leaderboard_upload_allowed(True) == (False, "disabled_by_operator")
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
+    def test_operator_switch_off_values(self, monkeypatch, value):
+        monkeypatch.setenv("OMLX_DISABLE_LEADERBOARD_UPLOAD", value)
+        assert leaderboard_upload_disabled() is False
+        assert leaderboard_upload_allowed(True) == (True, None)
+
+    def test_switch_unset_allows_consented_run(self, monkeypatch):
+        monkeypatch.delenv("OMLX_DISABLE_LEADERBOARD_UPLOAD", raising=False)
+        assert leaderboard_upload_disabled() is False
+        assert leaderboard_upload_allowed(True) == (True, None)
+
+    @pytest.mark.asyncio
+    async def test_run_without_consent_skips_upload(self):
+        run = BenchmarkRun(
+            bench_id="bench-consent",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+            ),
+        )
+        upload = AsyncMock()
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", upload):
+            await run_benchmark(run, _FakeBenchEnginePool(None))
+
+        upload.assert_not_awaited()
+        assert run.upload_state["phase"] == "skipped"
+        assert run.upload_state["skipped_reason"] == "not_requested"
+        skipped = [e for e in run.events if e["type"] == "upload_skipped"]
+        assert len(skipped) == 1
+        assert skipped[0]["reason"] == "not_requested"
+
+    @pytest.mark.asyncio
+    async def test_run_with_consent_uploads(self):
+        run = BenchmarkRun(
+            bench_id="bench-consent-yes",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+                upload_to_leaderboard=True,
+            ),
+        )
+        upload = AsyncMock()
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", upload):
+            await run_benchmark(run, _FakeBenchEnginePool(None))
+
+        upload.assert_awaited_once()

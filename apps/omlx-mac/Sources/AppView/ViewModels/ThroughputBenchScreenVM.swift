@@ -38,6 +38,11 @@ final class ThroughputBenchScreenVM {
     var promptLengths: Set<Int> = [4096, 16384]
     var genLength: String = "128"
     var batchSizes: Set<Int> = [2, 4]
+    /// Opt-in publish to the public omlx.ai leaderboard. Deliberately not
+    /// persisted across runs: the submission carries a stable
+    /// hardware-derived owner_hash, so each run asks again rather than
+    /// inheriting a yes the user gave once.
+    var uploadToLeaderboard: Bool = false
     var exportOpen: Bool = false
 
     // Server state
@@ -229,7 +234,8 @@ final class ThroughputBenchScreenVM {
             alignPromptToAne: alignPromptToAne,
             promptLengths: promptLengths.sorted(),
             generationLength: Int(genLength) ?? 128,
-            batchSizes: batchSizes.sorted()
+            batchSizes: batchSizes.sorted(),
+            uploadToLeaderboard: uploadToLeaderboard
         )
         // Wipe the previous run's tables so a new run doesn't accumulate
         // across unrelated configurations.

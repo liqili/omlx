@@ -567,7 +567,12 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            // Opt-in consent for publishing to the public omlx.ai leaderboard.
+            // Deliberately not persisted: the submission carries a stable
+            // hardware-derived owner_hash, so each run asks again rather than
+            // inheriting a yes the user gave once.
+            benchUploadConsent: false,
+            benchUploadSkipped: null,  // { reason } — external endpoint, or no consent for this run
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -639,6 +644,9 @@
             accBatchSize: 1,
             accEnableThinking: false,
             accSamplingProfile: 'deterministic',
+            // Opt-in consent for the omlx.ai leaderboard, same contract as
+            // benchUploadConsent. Not persisted — asked per queued run.
+            accUploadConsent: false,
             accAdvancedOptionsOpen: false,
             accExternalEnabled: false,
             // Provider-specific JSON is intentionally session-only.
@@ -3837,6 +3845,7 @@
                             generation_length: 128,
                             batch_sizes: batchSizes,
                             force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                            upload_to_leaderboard: this.benchUploadConsent,
                             external: this.benchExternalEnabled ? this.externalRequestBody() : null,
                         }),
                     });
@@ -4544,6 +4553,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
+                            upload_to_leaderboard: this.accUploadConsent,
                             external: externalRequest,
                         }),
                     });

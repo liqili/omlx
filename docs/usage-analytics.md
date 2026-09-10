@@ -121,3 +121,44 @@ login flow:
 curl -b /path/to/admin-cookies.txt \
   'http://127.0.0.1:8000/admin/api/usage?range=month&model=your-model-id'
 ```
+
+## What else can leave this machine
+
+Usage history above never leaves the server. One separate feature does send
+data out, and only when you ask it to:
+
+**Community benchmark publishing.** The throughput and accuracy benchmarks can
+publish their results to the public leaderboard at
+[omlx.ai/benchmarks](https://omlx.ai/benchmarks). This is **off by default**.
+Each run asks separately — tick *Publish to the omlx.ai leaderboard* in the
+benchmark form (web dashboard or macOS app) before starting the run. Clients
+that do not send `upload_to_leaderboard` never publish, so direct API callers
+stay local unless they opt in explicitly.
+
+A published submission contains:
+
+- Hardware: chip name and variant, memory, GPU core count
+- Versions: macOS and oMLX
+- The run: model name and repo, quantization, settings, feature flags,
+  scores, token throughput and timings
+- `owner_hash`: `SHA-256(hardware UUID + chip + GPU cores + memory)`. The raw
+  hardware UUID is never sent. The hash is stable for a given Mac, so
+  submissions from the same machine are linkable to each other — that is what
+  groups your entries on the leaderboard — but it carries no name, account or
+  address.
+- Accuracy runs only: the model's own answer to each benchmark question.
+  Question text is excluded (the datasets ship inside oMLX, so a question id
+  reconstructs the prompt locally).
+
+It never contains prompts, chat messages, completions, API keys, request
+headers, client IPs, file names or document contents.
+
+To guarantee no run can publish regardless of what a client requests — useful
+on a shared or headless server — set:
+
+```sh
+export OMLX_DISABLE_LEADERBOARD_UPLOAD=1
+```
+
+The benchmark still runs; the results simply stay local and the UI reports
+`disabled_by_operator`.
