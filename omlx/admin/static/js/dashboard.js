@@ -43,6 +43,10 @@
         'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
+        'moe_expert_offload_enabled',
+        'moe_expert_offload_resident_fraction',
+        'qwen35_oq_a8_enabled',
+        'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -240,6 +244,10 @@
                 qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
+                moe_expert_offload_enabled: false,
+                moe_expert_offload_resident_fraction: 0.25,
+                qwen35_oq_a8_enabled: false,
+                qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -681,6 +689,12 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('globalSettings.server.host', (value) => {
+                    if (!this.isLoopbackBindHost(value)) {
+                        this.globalSettings.auth.skip_api_key_verification = false;
+                    }
+                });
+
                 // When the user returns to this browser tab after looking
                 // elsewhere, re-check whether a different bench just started
                 // in another tab. Fires the banner without requiring an
@@ -717,6 +731,8 @@
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
                 });
+
+                window.addEventListener('focus', () => this.refreshOpenModelSettings());
 
                 // Pause stats polling when tab is hidden to reduce server load
                 document.addEventListener('visibilitychange', () => {
@@ -941,6 +957,35 @@
                 }
             },
 
+            isLoopbackBindHost(value) {
+                const hosts = String(value || '')
+                    .split(',')
+                    .map(host => host.trim().toLowerCase())
+                    .filter(Boolean);
+                if (hosts.length === 0) return false;
+                return hosts.every(host => {
+                    if (host.replace(/\.+$/, '') === 'localhost') return true;
+                    if (!host.includes(':')) {
+                        const parts = host.split('.');
+                        return parts.length === 4 && parts[0] === '127'
+                            && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part)
+                                && Number(part) <= 255);
+                    }
+                    // Normalize IPv6, including expanded and IPv4-mapped forms.
+                    // A scope ID does not change whether an address is loopback.
+                    const [address, scope, extra] = host.split('%');
+                    if (extra !== undefined || scope === '') return false;
+                    if (!/^[0-9a-f:.]+$/.test(address)) return false;
+                    try {
+                        const normalized = new URL(`http://[${address}]/`).hostname;
+                        return normalized === '[::1]'
+                            || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalized);
+                    } catch {
+                        return false;
+                    }
+                });
+            },
+
             async saveGlobalSettings() {
                 this.saving = true;
                 this.saveSuccess = false;
@@ -966,6 +1011,15 @@
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
                     return;
+                }
+
+                if (!this.isLoopbackBindHost(s.server.host)) {
+                    s.auth.skip_api_key_verification = false;
+                    if (!s.auth.api_key && !s.auth.api_key_set) {
+                        this.saveError = window.t('js.error.api_key_required_network');
+                        this.saving = false;
+                        return;
+                    }
                 }
 
                 // Validate API key if provided
@@ -1386,13 +1440,35 @@
                 if (description) lines.push(description);
                 return lines.join('\n');
             },
+            matchingProfileTemplate(profile) {
+                if (!profile?.source_template) return null;
+                const template = this.templates.find(t => t.name === profile.source_template);
+                if (!template) return null;
+                const canonical = value => {
+                    if (Array.isArray(value)) return value.map(canonical);
+                    if (value && typeof value === 'object') {
+                        return Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])]));
+                    }
+                    return value;
+                };
+                return JSON.stringify(canonical(profile.settings || {})) === JSON.stringify(canonical(template.settings || {}))
+                    ? template : null;
+            },
+            get visibleModelProfiles() {
+                return this.profiles.filter(p => p.expose_as_model || !this.matchingProfileTemplate(p));
+            },
+            get activeTemplateName() {
+                const profile = this.profiles.find(p => p.name === this.activeProfileName);
+                return this.matchingProfileTemplate(profile)?.name || null;
+            },
             async loadProfilesForModel(modelId) {
+                const seq = this._applySeq;
                 this.profiles = [];
                 try {
                     const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
                     if (r.ok) {
                         const data = await r.json();
-                        this.profiles = data.profiles || [];
+                        if (seq === this._applySeq) this.profiles = data.profiles || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1671,6 +1747,18 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    deepseek_v41_ced_prefill_enabled:
+                        s.deepseek_v41_ced_prefill_enabled === true,
+                    deepseek_v41_ced_prefill_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
+                        || s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_requested:
+                        s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_supported:
+                        model?.deepseek_v41_engram_ssd_offload_supported === true,
+                    deepseek_v41_engram_ssd_offload_forced:
+                        model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -1683,6 +1771,10 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
+                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -1827,6 +1919,8 @@
                 return slug || 'profile';
             },
             async createProfile() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 const displayName = (this.newProfile.display_name || '').trim();
@@ -1848,6 +1942,7 @@
                     description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
+                    expose_as_model: !!this.newProfile.expose_as_model,
                 };
                 try {
                     const r = await fetch(
@@ -1856,6 +1951,9 @@
                           body: JSON.stringify(body) }
                     );
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
+                        await this.applyProfileToForm(data.profile);
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
@@ -1870,17 +1968,20 @@
                     this.profileError = String(e);
                 }
             },
-            async applyProfileToForm(profile) {
+            async applyProfileToForm(profile, fromTemplate = false) {
+                const modelId = this.selectedModel?.id;
+                if (!modelId) return;
                 const seq = ++this._applySeq;
                 this.profileError = '';
                 try {
                     const r = await fetch(
-                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        `/admin/api/models/${encodeURIComponent(modelId)}/${fromTemplate ? "profile-templates" : "profiles"}/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
-                    if (seq !== this._applySeq) return;  // superseded by a newer click
+                    if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;  // superseded by a newer click
                     if (r.ok) {
                         const data = await r.json();
+                        if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;
                         const activeName = data.settings?.active_profile_name || profile.name;
                         const settings = {
                             ...(data.settings || {}),
@@ -1895,9 +1996,11 @@
                         }
                         this.activeProfileName = activeName;
                         this.profilesDrift = false;
+                        this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                         // Update the models list so the profile badge reflects the change
-                        const m = this.models.find(m => m.id === this.selectedModel.id);
+                        const m = this.models.find(m => m.id === modelId);
                         if (m) m.settings = { ...settings };
+                        await this.loadProfilesForModel(modelId);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1910,48 +2013,7 @@
                 }
             },
             async applyTemplateToForm(template) {
-                // Check if a profile with this template's name already exists
-                const existingProfile = this.profiles.find(p => p.name === template.name);
-
-                if (existingProfile) {
-                    // Global templates are the source of truth in this scope.
-                    const updatedProfile = await this.updateProfile(existingProfile.name, {
-                        settings: template.settings,
-                        source_template: template.name,
-                    });
-                    if (updatedProfile) {
-                        await this.applyProfileToForm(updatedProfile);
-                    }
-                } else {
-                    // Create a new profile from the template
-                    const body = {
-                        name: template.name,
-                        display_name: template.display_name,
-                        api_name: this.slugifyProfileApiName(template.display_name || template.name),
-                        description: template.description || null,
-                        settings: template.settings,
-                        source_template: template.name,
-                    };
-                    
-                    try {
-                        const r = await fetch(
-                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
-                            { method: 'POST', headers: {'Content-Type': 'application/json'},
-                              body: JSON.stringify(body) }
-                        );
-                        if (r.ok) {
-                            // Reload profiles first to include the new one
-                            await this.loadProfilesForModel(this.selectedModel.id);
-                            // Find the newly created profile in the refreshed list
-                            const newProfile = this.profiles.find(p => p.name === template.name);
-                            if (newProfile) {
-                                await this.applyProfileToForm(newProfile);
-                            }
-                        }
-                    } catch (e) {
-                        console.error('Failed to create profile from template:', e);
-                    }
-                }
+                await this.applyProfileToForm(template, true);
             },
             async deleteProfile(name) {
                 if (!this.selectedModel) return;
@@ -1996,10 +2058,13 @@
                 };
                 return this.updateProfile(p.name, patch);
             },
-            updateProfileSettingsFromForm(p) {
-                return this.updateProfile(p.name, {
+            async updateProfileSettingsFromForm(p) {
+                const updated = await this.updateProfile(p.name, {
                     settings: this.formValuesForProfile(),
                 });
+                if (updated && this.activeProfileName === p.name) {
+                    await this.applyProfileToForm(updated);
+                }
             },
             async updateProfile(name, patch) {
                 // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
@@ -2031,6 +2096,8 @@
                 }
             },
             async createTemplate() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
@@ -2053,7 +2120,10 @@
                         body: JSON.stringify(body),
                     });
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
                         await this.loadTemplates();
+                        await this.applyTemplateToForm(data.template);
                         this.showNewTemplateForm = false;
                         this.newTemplate = { name: '', display_name: '', description: '' };
                     } else if (r.status === 401) {
@@ -2076,6 +2146,11 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        const active = this.profiles.find(p => p.name === this.activeProfileName);
+                        if (patch.settings && active?.source_template === name) {
+                            const template = this.templates.find(t => t.name === name);
+                            if (template) await this.applyTemplateToForm(template);
+                        }
                         this.editingTemplate = null;
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
@@ -2095,6 +2170,7 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        if (this.selectedModel) await this.loadProfilesForModel(this.selectedModel.id);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2368,7 +2444,21 @@
                 }
             },
 
-            async openModelSettings(model) {
+            async refreshOpenModelSettings() {
+                if (!this.showModelSettingsModal || !this.selectedModel) return;
+                const modelId = this.selectedModel.id;
+                const baseline = this._modelSettingsBaseline;
+                if (JSON.stringify(this.modelSettings) !== baseline) return;
+                if (this.showNewProfileForm || this.showNewTemplateForm || this.editingProfile || this.editingTemplate) return;
+                await this.loadModels();
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId
+                    || JSON.stringify(this.modelSettings) !== baseline) return;
+                const model = this.models.find(m => m.id === modelId);
+                if (model) await this.openModelSettings(model, true);
+            },
+            async openModelSettings(model, preservingEdits = false) {
+                const baseline = JSON.stringify(this.modelSettings);
+                const seq = ++this._applySeq;
                 this.profileError = '';
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
@@ -2403,6 +2493,10 @@
                         } catch (_) { /* network error */ }
                     }
                 }
+                if (seq !== this._applySeq) return;
+                if (preservingEdits && (!this.showModelSettingsModal
+                    || this.selectedModel?.id !== model.id
+                    || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
@@ -2413,6 +2507,7 @@
                 } else {
                     this.computeDrift();
                 }
+                this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
             },
 
@@ -2438,6 +2533,27 @@
                 } finally {
                     this.importingMtplx = false;
                 }
+            },
+
+            isQwenOqA8Model(model) {
+                const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
+                return ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
+            },
+
+            validateQwenOqA8Settings() {
+                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+                // Both wrap the same MLP call, so the combination silently
+                // disables one of them. Caught here so the modal explains it
+                // instead of surfacing the server's 400.
+                if (this.modelSettings.qwen35_ane_prefill_enabled) {
+                    return 'ANE prefill and INT8 activation prefill cannot both be '
+                        + 'enabled; they accelerate the same projections. Turn one off.';
+                }
+                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                if (!Number.isInteger(minTokens) || minTokens < 1) {
+                    return 'oQ A8 minimum prompt tokens must be a positive integer.';
+                }
+                return null;
             },
 
             validateQwenAneSettings() {
@@ -2520,6 +2636,12 @@
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
+                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
+                if (qwenOqA8ValidationError) {
+                    alert(qwenOqA8ValidationError);
+                    return;
+                }
+
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
@@ -2581,6 +2703,12 @@
                                 enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                deepseek_v41_ced_prefill_enabled:
+                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
+                                deepseek_v41_engram_ssd_offload:
+                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
+                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
+                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -2600,6 +2728,10 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
+                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
                                 // Validation only runs when the feature is enabled, so a
                                 // blank numeric input must fall back to the server default

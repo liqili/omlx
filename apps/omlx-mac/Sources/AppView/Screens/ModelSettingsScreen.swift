@@ -61,6 +61,9 @@ struct ModelSettingsScreen: View {
             }
         }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await vm.load(modelID: modelID, client: services.client, preservingEdits: true) }
+        }
     }
 
     @ViewBuilder
@@ -164,7 +167,7 @@ private struct ProfilesTab: View {
         VStack(alignment: .leading, spacing: 0) {
             // Active state banner — three variants (working / named / defaults).
             ActiveProfileBanner(
-                state: vm.activeProfileState,
+                state: vm.displayProfileState,
                 isSlim: false,
                 onUpdateBasedOn: {
                     if case .working(let basedOn) = vm.activeProfileState, let basedOn {
@@ -221,6 +224,7 @@ private struct ProfilesTab: View {
                               defaultValue: "Global Profiles",
                               comment: "Section label above the user-defined global profile templates chip group"),
                 names: vm.templates.filter { $0.templateScope == .global }.map(\.name),
+                displayNames: Dictionary(uniqueKeysWithValues: vm.templates.map { ($0.name, $0.displayName) }),
                 activeName: vm.activeProfileState.activeName(in: .global),
                 basedOnName: vm.activeProfileState.basedOnName(in: .global),
                 previewName: preview?.scope == .global ? preview?.name : nil,
@@ -238,8 +242,11 @@ private struct ProfilesTab: View {
                               defaultValue: "Model Profiles · \(vm.model?.id ?? vm.modelID)",
                               comment: "Section label for the per-model profile chip group; placeholder is the model id"),
                 names: vm.profiles
-                    .filter { $0.sourceTemplate == nil }
+                    .filter { profile in
+                        profile.exposeAsModel == true || profile.matchingTemplate(in: vm.templates) == nil
+                    }
                     .map(\.name),
+                displayNames: Dictionary(uniqueKeysWithValues: vm.profiles.map { ($0.name, $0.displayName) }),
                 activeName: vm.activeProfileState.activeName(in: .model),
                 basedOnName: vm.activeProfileState.basedOnName(in: .model),
                 previewName: preview?.scope == .model ? preview?.name : nil,
@@ -288,7 +295,7 @@ private struct ProfilesTab: View {
     private var detailCard: some View {
         if let preview, let tpl = lookupSettings(scope: preview.scope, name: preview.name) {
             ProfileDetailCard(
-                name: preview.name,
+                name: vm.profileDisplayName(scope: preview.scope, name: preview.name),
                 scope: preview.scope,
                 settings: tpl,
                 isActive: vm.activeProfileState.activeName(in: preview.scope) == preview.name,
@@ -328,9 +335,9 @@ private struct ProfilesTab: View {
                     }
                 },
                 onClosePreview: { self.preview = nil },
-                exposeAsModel: modelProfile(named: preview.name)?.exposeAsModel ?? false,
-                exposedModelId: modelProfile(named: preview.name)?.modelId,
-                hasEngineFields: modelProfile(named: preview.name)?.hasEngineFields ?? false,
+                exposeAsModel: modelProfile(scope: preview.scope, named: preview.name)?.exposeAsModel ?? false,
+                exposedModelId: modelProfile(scope: preview.scope, named: preview.name)?.modelId,
+                hasEngineFields: modelProfile(scope: preview.scope, named: preview.name)?.hasEngineFields ?? false,
                 onToggleExpose: preview.scope == .model
                     ? { exposed in
                         Task {
@@ -353,7 +360,9 @@ private struct ProfilesTab: View {
                     settings: vm.currentSettingsDict(),
                     isActive: true,
                     isWorking: true,
-                    basedOn: basedOn,
+                    basedOn: basedOn.map {
+                        .init(scope: $0.scope, name: vm.profileDisplayName(scope: $0.scope, name: $0.name))
+                    },
                     isWorkingBase: false,
                     compact: false,
                     hasWorking: true
@@ -361,7 +370,7 @@ private struct ProfilesTab: View {
             case .named(let scope, let name):
                 let settings = lookupSettings(scope: scope, name: name) ?? [:]
                 ProfileDetailCard(
-                    name: name,
+                    name: vm.profileDisplayName(scope: scope, name: name),
                     scope: scope,
                     settings: settings,
                     isActive: true,
@@ -370,9 +379,9 @@ private struct ProfilesTab: View {
                     isWorkingBase: false,
                     compact: false,
                     hasWorking: false,
-                    exposeAsModel: modelProfile(named: name)?.exposeAsModel ?? false,
-                    exposedModelId: modelProfile(named: name)?.modelId,
-                    hasEngineFields: modelProfile(named: name)?.hasEngineFields ?? false,
+                    exposeAsModel: modelProfile(scope: scope, named: name)?.exposeAsModel ?? false,
+                    exposedModelId: modelProfile(scope: scope, named: name)?.modelId,
+                    hasEngineFields: modelProfile(scope: scope, named: name)?.hasEngineFields ?? false,
                     onToggleExpose: scope == .model
                         ? { exposed in
                             Task {
@@ -403,8 +412,9 @@ private struct ProfilesTab: View {
 
     /// Per-model profile DTO lookup — source of the expose-as-model state
     /// and the derived model ID shown on the detail card.
-    private func modelProfile(named name: String) -> ProfileDTO? {
-        vm.profiles.first { $0.name == name }
+    private func modelProfile(scope: ProfileScope, named name: String) -> ProfileDTO? {
+        if scope == .model { return vm.profiles.first { $0.name == name } }
+        return vm.profiles.first { $0.matchingTemplate(in: vm.templates)?.name == name }
     }
 
     private func previewChip(scope: ProfileScope, name: String) {
@@ -637,7 +647,7 @@ private struct BasicEditBanner: View {
         default:
             VStack(alignment: .leading, spacing: 0) {
                 ActiveProfileBanner(
-                    state: vm.activeProfileState,
+                    state: vm.displayProfileState,
                     isSlim: true,
                     onUpdateBasedOn: {
                         if case .working(let basedOn) = vm.activeProfileState, let basedOn {
@@ -1164,14 +1174,35 @@ private struct ExperimentalSection: View {
                         }
                     }
                 }
-                if vm.isQwen35AnePrefillModel {
+                if vm.isQwenOqA8Model {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                      defaultValue: "Qwen INT8 Activation Prefill",
+                                      comment: "Row label for the oQ INT8-activation prefill kernels"),
+                        sublabel: qwenOqA8Sublabel) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                            .disabled(vm.qwen35OqA8ConflictReason != nil)
+                            .help(vm.qwen35OqA8ConflictReason ?? "")
+                    }
+                    if vm.qwen35OqA8Enabled {
+                        Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                          defaultValue: "Minimum Prompt Tokens",
+                                          comment: "Row label for the oQ A8 minimum prompt length"),
+                            sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                             defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                             comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                      placeholder: "128", mono: true,
+                                      isNumeric: true, range: 1...262_144,
+                                      step: 64, width: .controlCompact)
+                        }
+                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
-                        sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                         defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
-                                         comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
+                        sublabel: qwenAnePrefillSublabel) {
                         RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                            .disabled(vm.qwen35AnePrefillConflictReason != nil)
+                            .help(vm.qwen35AnePrefillConflictReason ?? "")
                     }
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
@@ -1732,6 +1763,20 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.dflash.ssd_cache.sub",
                       defaultValue: "L2 spill of evicted L1 entries to disk.",
                       comment: "Default sublabel for the DFlash SSD cache toggle")
+    }
+
+    private var qwenOqA8Sublabel: String {
+        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      comment: "Sublabel describing the oQ INT8-activation prefill kernels")
+    }
+
+    private var qwenAnePrefillSublabel: String {
+        if let reason = vm.qwen35AnePrefillConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_ane.sub",
+                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")
     }
 
     private var vlmMtpToggleDisabled: Bool {

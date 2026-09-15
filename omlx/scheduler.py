@@ -37,6 +37,9 @@ from mlx_lm.generate import (
     SequenceStateMachine,
 )
 from mlx_lm.models.cache import (
+    ArraysCache as _MLXArraysCache,
+)
+from mlx_lm.models.cache import (
     KVCache as _MLXKVCache,
 )
 from mlx_lm.models.cache import (
@@ -47,6 +50,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
+from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -67,6 +71,7 @@ from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
+    MTPProcessorContractError,
     supports_vlm_mtp_processing,
 )
 from .speculative.vlm_mtp import (
@@ -100,8 +105,14 @@ def _compact_boundary_snapshot_value(
     ):
         with mx.stream(stream):
             compact_pooling_cache_snapshot(value[1], token_count, block_size)
+            compact_deepseek_v41_snapshot(value[1], token_count, block_size)
             delta_arrays = []
             for layer in value[1]:
+                if (
+                    layer.get("class_name") == "DeepseekV41Cache"
+                    and len(layer.get("state", ())) == 8
+                ):
+                    delta_arrays.extend(layer["state"][i] for i in (2, 3))
                 for sub_idx in layer.get("pooling_delta_ranges", {}):
                     pooled = layer["state"][int(sub_idx)][2]
                     if isinstance(pooled, mx.array):
@@ -234,6 +245,7 @@ class _VLMMTPResponse:
     finish_reason: Optional[str] = None
     logprobs: Any = None
     prompt_cache: Any = None
+    error: str | None = None
 
 
 @dataclass
@@ -1583,7 +1595,6 @@ class SchedulingPolicy(Enum):
     PRIORITY = "priority"  # Priority-based
 
 
-
 def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_enabled: bool, block_size: int) -> int:
     """Size the prefill loops give the next chunk: the step, clamped to the next block boundary."""
     next_n = min(step_size, remaining)
@@ -2508,6 +2519,7 @@ class Scheduler:
         paged_cache_manager and block_aware_cache rely on
         threading.RLock so concurrent access from main and worker is safe.
         """
+        self._store_cache_thread_id = threading.get_ident()
         try:
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
             # access. store_cache eventually drives _extract_tensor_bytes,
@@ -2913,7 +2925,10 @@ class Scheduler:
             return any(
                 Scheduler._cache_tree_has_arrays_cache(sub) for sub in sub_caches
             )
-        return type(cache_obj).__name__ in ("ArraysCache", "SizedArraysCache")
+        return isinstance(cache_obj, _MLXArraysCache) or type(cache_obj).__name__ in (
+            "ArraysCache",
+            "SizedArraysCache",
+        )
 
     def _load_generation_config_eos(self) -> set[int] | None:
         """Load EOS token IDs from generation_config.json if available."""
@@ -5057,21 +5072,20 @@ class Scheduler:
         )
 
     def _supports_skip_lm_head(self) -> bool:
-        """Whether the loaded model accepts ``skip_lm_head=True``.
+        """Whether prefill can omit the vocabulary projection.
 
-        Chunked prefill discards every chunk's logits (the prompt's final
-        token is scored by the first decode step), so models whose patched
-        ``__call__`` accepts the flag can skip the full-vocabulary
-        projection for every prefill chunk — for a 129k-vocab model that
-        GEMM is the single largest per-chunk matmul and was pure waste.
-        Detected once per scheduler; unknown models keep stock behavior.
+        Wrappers may accept the flag without implementing it for every model.
+        Honor their explicit capability before checking the call signature.
+        The result is cached once per scheduler.
         """
         supported = getattr(self, "_skip_lm_head_supported", None)
         if supported is None:
             try:
                 call = getattr(type(self.model), "__call__", None)
+                capability = getattr(self.model, "supports_skip_lm_head", None)
                 supported = bool(
-                    call is not None
+                    capability is not False
+                    and call is not None
                     and "skip_lm_head" in inspect.signature(call).parameters
                 )
             except Exception:
@@ -5316,11 +5330,10 @@ class Scheduler:
         cap = self._contended_prefill_cap()
         if cap and size > cap:
             logger.debug(
-                "[fairness] prefill chunk capped %d -> %d (decode running "
-                "on %s engine)",
+                "[fairness] Prefill chunk reduced from %d to %d tokens "
+                "to share GPU time with concurrent responses",
                 size,
                 cap,
-                "this" if self.running else "another",
             )
             size = cap
         return size
@@ -8992,12 +9005,22 @@ class Scheduler:
         if manager is None:
             return True
         try:
-            manager.close()
+            teardown = getattr(self, "_engine_teardown", None)
+            if teardown is not None:
+                teardown.set_phase("draft_ssd", manager.persistence_progress)
+                manager.close(teardown=teardown)
+                teardown.set_phase("scheduler_cleanup")
+            else:
+                manager.close()
         except Exception as e:
+            if getattr(self, "_engine_teardown", None) is not None:
+                fatal_exit(f"SpecPrefill draft SSD cache shutdown failed: {e}")
             logger.warning("SpecPrefill draft SSD cache shutdown error: %s", e)
             return False
         writer_thread = getattr(manager, "_writer_thread", None)
         if writer_thread is not None and writer_thread.is_alive():
+            if getattr(self, "_engine_teardown", None) is not None:
+                fatal_exit("SpecPrefill draft SSD cache writer survived teardown")
             logger.warning(
                 "SpecPrefill draft SSD cache writer remains active after shutdown"
             )
@@ -9337,6 +9360,15 @@ class Scheduler:
             try:
                 with mx.stream(self._stream):
                     token_val = next(state.generator)
+            except MTPProcessorContractError as exc:
+                # Keep the entry until response processing runs abort cleanup.
+                # Failed verify caches must never enter the prefix cache.
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid, token=0, finish_reason="error", error=str(exc)
+                    )
+                )
+                continue
             except StopIteration:
                 # Round loop exited naturally — terminate with prompt cache
                 # so the prefix-cache layer can keep using it.
@@ -11342,6 +11374,19 @@ class Scheduler:
             if request is None:
                 continue
 
+            if isinstance(response, _VLMMTPResponse) and response.error is not None:
+                self._do_abort_request(request_id)
+                outputs.append(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error=response.error,
+                    )
+                )
+                finished_ids.add(request_id)
+                continue
+
             request.last_activity_at = step_now
             completion_tokens_before = request.num_output_tokens
 
@@ -12936,6 +12981,13 @@ class Scheduler:
 
         logger.info("Deep reset completed - all caches cleared")
 
+    def _store_persistence_progress(self):
+        manager = self.paged_ssd_cache_manager
+        thread_id = getattr(self, "_store_cache_thread_id", None)
+        if manager is None or thread_id is None:
+            return None
+        return manager.persistence_progress(thread_id)
+
     def shutdown(self) -> None:
         """
         Graceful shutdown.
@@ -12943,6 +12995,7 @@ class Scheduler:
         Flushes hot cache to SSD and closes the background writer.
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
+        teardown = getattr(self, "_engine_teardown", None)
         logger.info("Scheduler shutdown initiated...")
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)
@@ -12960,8 +13013,17 @@ class Scheduler:
                         "Waiting for %d inflight async store_cache future(s)...",
                         len(inflight),
                     )
+                    if teardown is not None:
+                        teardown.set_phase(
+                            "store_cache", self._store_persistence_progress
+                        )
                     _done, not_done = concurrent.futures.wait(
-                        inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+                        inflight,
+                        timeout=(
+                            teardown.remaining()
+                            if teardown is not None
+                            else FATAL_TEARDOWN_TIMEOUT_S
+                        ),
                     )
                     if not_done:
                         fatal_exit(
@@ -12969,12 +13031,20 @@ class Scheduler:
                             f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for "
                             f"{len(not_done)} async store_cache future(s)"
                         )
+                if teardown is not None:
+                    teardown.set_phase("store_cache_cleanup")
                 self._drain_pending_async_removes()
                 try:
                     clear_future = self._store_cache_executor.submit(
                         clear_thread_streams
                     )
-                    clear_future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+                    clear_future.result(
+                        timeout=(
+                            teardown.remaining(mlx=True)
+                            if teardown is not None
+                            else FATAL_TEARDOWN_TIMEOUT_S
+                        )
+                    )
                 except concurrent.futures.TimeoutError:
                     fatal_exit(
                         "Scheduler shutdown timed out after "
@@ -13014,7 +13084,14 @@ class Scheduler:
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
         if self.paged_ssd_cache_manager is not None:
-            self.paged_ssd_cache_manager.close()
+            if teardown is not None:
+                teardown.set_phase(
+                    "primary_ssd", self.paged_ssd_cache_manager.persistence_progress
+                )
+                self.paged_ssd_cache_manager.close(teardown=teardown)
+                teardown.set_phase("scheduler_cleanup")
+            else:
+                self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
         # Release whatever the per-path unregisters did not reach, so nothing
         # survives this engine in the module-level row registry.

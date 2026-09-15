@@ -1,7 +1,11 @@
 """Regression tests for admin model-settings UI gates."""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 def _model_settings_template() -> str:
@@ -31,7 +35,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     turboquant = _section(
         html,
         "<!-- TurboQuant KV Cache -->",
-        "<!-- IndexCache (DSA models only) -->",
+        "<!-- MoE Expert Offload -->",
     )
     lightning_mtp = _section(
         html,
@@ -52,18 +56,6 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
-
-
-def test_apply_profile_surfaces_server_validation_error():
-    script = _dashboard_script()
-    method = script.split("async applyProfileToForm(profile) {", 1)[1].split(
-        "async applyTemplateToForm(template) {", 1
-    )[0]
-
-    assert "this.profileError = '';" in method
-    assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
-    assert "this.profileError = String(e);" in method
 
 
 def test_reasoning_effort_has_presets_and_custom_input():
@@ -307,3 +299,212 @@ def test_js_embedded_translations_escape_apostrophes():
         r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
     )
     assert unsafe == []
+
+
+def test_oq_a8_toggle_is_gated_to_qwen35_models():
+    """The kernels only exist for this checkpoint family, so the UI hides them."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert 'x-if="isQwenOqA8Model(selectedModel)"' in section
+    assert "modelSettings.qwen35_oq_a8_enabled" in section
+    # The detail controls only appear once the feature is on.
+    assert 'x-show="modelSettings.qwen35_oq_a8_enabled"' in section
+    assert "modelSettings.qwen35_oq_a8_min_tokens" in section
+
+
+def test_oq_a8_offers_no_kernel_choice():
+    """The tile is not a user-facing choice: the dispatcher picks it per bit
+    width from a measured default, so the modal exposes only the toggle and
+    the token floor."""
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+    )
+    assert "modelSettings.qwen35_oq_a8_variant" not in section
+
+
+def test_oq_a8_settings_are_registered_in_the_dashboard_script():
+    js = _dashboard_script()
+    for field in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+        # Profile-field registry, modal defaults, server load, and save payload.
+        assert js.count(field) >= 4, field
+    assert "validateQwenOqA8Settings()" in js
+    # The modal has to explain the ANE clash itself rather than let the save
+    # come back as a bare 400 with the toggle already flipped.
+    validator = js.split("validateQwenOqA8Settings()", 1)[1].split("},", 1)[0]
+    assert "qwen35_ane_prefill_enabled" in validator
+    # The tile must not leak into any of those four places, not even as a
+    # hidden default the modal never renders.
+    assert "qwen35_oq_a8_variant" not in js
+
+
+def test_oq_a8_labels_use_i18n_keys():
+    html = _model_settings_template()
+    assert "{{ t('modal.model_settings.qwen_oq_a8') }}" in html
+    assert ">Qwen INT8 Activation Prefill<" not in html
+
+
+def test_oq_a8_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    keys = {
+        "modal.model_settings.qwen_oq_a8",
+        "modal.model_settings.qwen_oq_a8_hint",
+        "modal.model_settings.qwen_oq_a8_min_tokens",
+    }
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        missing = keys - set(catalog)
+        assert not missing, f"{path.name} is missing {sorted(missing)}"
+
+
+def test_moe_expert_offload_toggle_blocks_speculative_decoding():
+    """Offload is incompatible with speculative verification paths."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" in section
+    for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
+        assert f"modelSettings.{key}" in section
+
+
+def test_profile_editor_behavior():
+    """Execute the dashboard methods, including async response and edit races."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+function setup(fetch) {
+    const context = {
+        localStorage: {getItem: () => null},
+        THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+        window: {}, navigator: {language: 'en'}, document: {}, fetch,
+    };
+    const state = vm.runInNewContext(source + '\n dashboard;', context)();
+    state.selectedModel = {id: 'model-a'};
+    state.models = [state.selectedModel];
+    state.loadProfilesForModel = async () => {};
+    return state;
+}
+
+test('Template apply uses server identity and effective settings', async () => {
+    const requests = [];
+    const state = setup(async (url, options) => {
+        requests.push([url, options.method]);
+        return {ok: true, json: async () => ({settings: {active_profile_name: 'copy-2', temperature: 0.9}})};
+    });
+    state.profiles = [{name:'coding', settings:{temperature:0.1}}];
+    await state.applyTemplateToForm({name:'coding', settings:{temperature:0.2}});
+    assert.deepEqual(requests, [['/admin/api/models/model-a/profile-templates/coding/apply', 'POST']]);
+    assert.equal(state.activeProfileName, 'copy-2');
+    assert.equal(state.modelSettings.temperature, 0.9);
+});
+
+test('Failed template application keeps the form and surfaces the error', async () => {
+    const state = setup(async () => ({ok:false, status:400, json:async()=>({detail:'Rejected'})}));
+    state.modelSettings.temperature = 0.1;
+    await state.applyTemplateToForm({name:'coding'});
+    assert.equal(state.profileError, 'Rejected');
+    assert.equal(state.modelSettings.temperature, 0.1);
+});
+
+test('Save as new invokes the corresponding apply action', async () => {
+    for (const global of [false, true]) {
+        const state = setup(async (url, options) => ({
+            ok: true, json: async () => ({[global ? 'template' : 'profile']: JSON.parse(options.body)}),
+        }));
+        let applied;
+        state.loadTemplates = async () => {};
+        const apply = global ? 'applyTemplateToForm' : 'applyProfileToForm';
+        state[apply] = async profile => { applied = profile; };
+        if (global) {
+            state.newTemplate = {display_name:'Coding', description:''};
+            await state.createTemplate();
+        } else {
+            state.newProfile = {display_name:'Coding', api_name:'coding', description:''};
+            await state.createProfile();
+        }
+        assert.equal(applied.display_name, 'Coding');
+    }
+});
+
+test('Focus refresh updates clean forms and preserves edits made while fetching', async () => {
+    const state = setup();
+    state.showModelSettingsModal = true;
+    state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    let opened = 0;
+    state.openModelSettings = async()=>{opened++;};
+    state.loadModels = async()=>{};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    state.loadModels = async()=>{state.modelSettings.temperature = 0.3;};
+    await state.refreshOpenModelSettings();
+    assert.equal(opened, 1);
+    await state.refreshOpenModelSettings();
+    assert.equal(state.modelSettings.temperature, 0.3);
+    assert.equal(opened, 1);
+});
+
+test('Apply response cannot replace another model editor', async () => {
+    let resolve;
+    const state = setup(() => new Promise(r => {resolve=r;}));
+    const pending = state.applyTemplateToForm({name:'coding'});
+    state.selectedModel = {id:'model-b'};
+    state.modelSettings.temperature = 0.4;
+    resolve({ok:true, json:async()=>({settings:{temperature:0.9}})});
+    await pending;
+    assert.equal(state.modelSettings.temperature, 0.4);
+});
+
+test('Only a current linked copy marks a global template active', () => {
+    const state = setup();
+    state.templates = [{name:'coding',settings:{temperature:0.9}}];
+    const independent = {name:'coding',settings:{temperature:0.1}};
+    const copy = {name:'copy',source_template:'coding',settings:{temperature:0.9}};
+    state.profiles = [independent, copy];
+    state.activeProfileName = 'coding';
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 1);
+    state.activeProfileName = 'copy';
+    assert.equal(state.activeTemplateName, 'coding');
+    copy.settings.temperature = 0.2;
+    assert.equal(state.activeTemplateName, null);
+    assert.equal(state.visibleModelProfiles.length, 2);
+    copy.settings.temperature = 0.9;
+    copy.expose_as_model = true;
+    assert.equal(state.visibleModelProfiles.length, 2);
+    state.templates = [];
+    assert.equal(state.visibleModelProfiles.length, 2);
+});
+
+
+test('Template matching ignores nested dictionary ordering', () => {
+    const state = setup();
+    state.templates = [{name:'coding', settings:{chat_template_kwargs:{enable_thinking:true,custom:1}}}];
+    const copy = {name:'copy', source_template:'coding', settings:{chat_template_kwargs:{custom:1,enable_thinking:true}}};
+    assert.equal(state.matchingProfileTemplate(copy).name, 'coding');
+    copy.settings.chat_template_kwargs.custom = 2;
+    assert.equal(state.matchingProfileTemplate(copy), null);
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
