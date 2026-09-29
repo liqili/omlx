@@ -162,3 +162,32 @@ export OMLX_DISABLE_LEADERBOARD_UPLOAD=1
 
 The benchmark still runs; the results simply stay local and the UI reports
 `disabled_by_operator`.
+
+## Requests the admin panel makes on its own
+
+Two admin endpoints contact vendor hosts without anyone asking for it:
+
+- **Update check.** While the dashboard or chat page is open it polls
+  `GET /admin/api/update-check` hourly, which asks the GitHub Releases API
+  for the `jundot/omlx` release list (cached 24h server-side).
+- **Preset refresh.** `POST /admin/api/presets/refresh` proxies
+  `https://omlx.ai/assets/omlx_preset.json` so the browser does not depend on
+  CORS headers on the remote host.
+
+Neither sends anything about the machine, the models or the requests it
+serves — no hardware details, no `owner_hash`, not even the installed
+version. What a vendor host can still observe is the server's IP address, the
+times it calls, and that it runs oMLX.
+
+To stop the server originating that traffic — for an isolated, audited or
+metered network — set:
+
+```sh
+export OMLX_OFFLINE=1
+```
+
+The update check then reports "no update" without a request, and preset
+refresh returns the same 502 the client already falls back from, so the
+bundled presets are used. The switch is read per request, so it takes effect
+without a restart. It does not affect model downloads, web search or cluster
+peers: those run only when you ask for them.
