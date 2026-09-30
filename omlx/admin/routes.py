@@ -73,6 +73,20 @@ logger = logging.getLogger(__name__)
 
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 
+# Two admin endpoints reach vendor hosts on their own: the dashboard polls
+# update-check hourly, and preset refresh proxies omlx.ai. Neither sends
+# anything about the operator, but both reveal the server's IP, its uptime
+# pattern and (for the release list) that it runs oMLX. An operator running
+# on an isolated or monitored network needs a way to guarantee the server
+# never originates that traffic. Set to 1/true/yes/on to enforce.
+OFFLINE_MODE_ENV = "OMLX_OFFLINE"
+
+
+def offline_mode() -> bool:
+    """True when the operator has hard-disabled vendor-host requests."""
+    value = os.getenv(OFFLINE_MODE_ENV, "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
 
 def _clear_cold_remote_cluster_cache_roots(
     roots: tuple[Path, ...],
@@ -3763,6 +3777,13 @@ async def refresh_presets(is_admin: bool = Depends(require_admin)):
     depend on CORS headers on the remote host. Any failure is surfaced as 502
     so the client can silently fall back to the bundled presets.
     """
+    if offline_mode():
+        # Same 502 the client already treats as "use the bundled presets",
+        # so offline mode degrades silently instead of surfacing an error.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Offline mode ({OFFLINE_MODE_ENV}): remote preset refresh disabled",
+        )
     try:
         resp = await asyncio.to_thread(
             requests.get,
@@ -8232,6 +8253,12 @@ async def check_update(
         "release_url": None,
         "update_channel": channel,
     }
+
+    if offline_mode():
+        # Not cached: the switch is read per call so flipping it takes effect
+        # without a restart, and an offline answer must never become the
+        # cached answer for a later online call.
+        return no_update
 
     try:
         # Use the releases list (not /releases/latest) and filter by the
